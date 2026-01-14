@@ -1,11 +1,16 @@
 import * as vscode from 'vscode';
 import { LLMService, LLMConfig, ChatMessage } from './LLMService';
+import { DebuggerTool, DebugState } from './DebuggerTool';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'llmentor.chatView';
     private _view?: vscode.WebviewView;
     private _llmService: LLMService | null = null;
     private _chatHistory: ChatMessage[] = [];
+    private _debuggerTool: DebuggerTool;
+    private _isWalkthroughActive: boolean = false;
+    private _sourceCode: string = '';
+    private _fileName: string = '';
 
     private readonly _systemPrompt = `You are LLMentor, a friendly and helpful AI programming tutor. 
 Your goal is to help students learn programming concepts clearly and effectively.
@@ -16,9 +21,9 @@ Your goal is to help students learn programming concepts clearly and effectively
 - Keep responses concise but thorough`;
 
     constructor(private readonly _extensionUri: vscode.Uri) {
+        this._debuggerTool = new DebuggerTool();
         this._initializeLLMService();
 
-        // Listen for config changes
         vscode.workspace.onDidChangeConfiguration((e) => {
             if (e.affectsConfiguration('llmentor')) {
                 this._initializeLLMService();
@@ -36,7 +41,6 @@ Your goal is to help students learn programming concepts clearly and effectively
             model: model,
         };
 
-        // Add provider-specific config
         switch (provider) {
             case 'ollama':
                 llmConfig.baseUrl = config.get<string>('ollamaBaseUrl', 'http://localhost:11434');
@@ -72,19 +76,389 @@ Your goal is to help students learn programming concepts clearly and effectively
 
         webviewView.webview.html = this._getHtmlContent();
 
+        if (context.state) {
+            this._isWalkthroughActive = (context.state as any).isWalkthroughActive || false;
+        }
+
         webviewView.webview.onDidReceiveMessage(async (message) => {
             switch (message.command) {
                 case 'sendMessage':
-                    await this._handleUserMessage(message.text);
+                    if (this._isWalkthroughActive) {
+                        await this._handleWalkthroughQuestion(message.text);
+                    } else {
+                        await this._handleUserMessage(message.text);
+                    }
                     break;
                 case 'clearChat':
                     this._chatHistory = [];
+                    this._isWalkthroughActive = false;
                     break;
                 case 'openSettings':
                     vscode.commands.executeCommand('llmentor.openSettings');
                     break;
+                case 'startDebugWalkthrough':
+                    await this._startDebugWalkthrough();
+                    break;
+                case 'stopDebugWalkthrough':
+                    await this._stopDebugWalkthrough();
+                    break;
+                case 'nextStep':
+                    await this._nextStep();
+                    break;
+                case 'stepBack':
+                    await this._stepBack();
+                    break;
+                case 'ready':
+                    this._syncWalkthroughState();
+                    break;
             }
         });
+    }
+
+    private _syncWalkthroughState() {
+        if (this._isWalkthroughActive) {
+            this._sendToWebview('walkthroughStarted', {});
+            this._updateStepBackButton();
+        }
+    }
+
+    private _updateStepBackButton() {
+        const canStepBack = this._debuggerTool.canStepBack();
+        this._sendToWebview('updateStepBackState', { canStepBack });
+    }
+
+    private async _startDebugWalkthrough() {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            this._sendToWebview('receiveMessage', {
+                text: '⚠️ Please open a file to debug first.',
+                isError: true
+            });
+            return;
+        }
+
+        if (!this._llmService) {
+            this._sendToWebview('receiveMessage', {
+                text: '⚠️ LLM not configured. Please check your settings (click ⚙️ above).',
+                isError: true
+            });
+            return;
+        }
+
+        this._sourceCode = editor.document.getText();
+        this._fileName = editor.document.fileName;
+        const language = editor.document.languageId;
+
+        this._isWalkthroughActive = true;
+        this._chatHistory = [];
+
+        this._sendToWebview('walkthroughStarted', {});
+        this._sendToWebview('receiveMessage', {
+            text: '🔍 Starting AI Debug Walkthrough...',
+            isDebug: true
+        });
+
+        this._sendToWebview('setLoading', { isLoading: true });
+
+        try {
+            const analysisPrompt = `You are helping a student understand their code by walking through it with a debugger.
+
+Here's the code:
+File: ${this._fileName}
+Language: ${language}
+
+\`\`\`${language}
+${this._sourceCode}
+\`\`\`
+
+Please provide a brief overview of what this code does (2-3 sentences max). Then say "Let's start the debugger and step through it together!"`;
+
+            const analysis = await this._llmService.chat(
+                [{ role: 'user', content: analysisPrompt }],
+                this._systemPrompt
+            );
+
+            this._sendToWebview('receiveMessage', {
+                text: analysis,
+                isDebug: true
+            });
+
+            this._sendToWebview('receiveMessage', {
+                text: '▶️ Starting debugger...',
+                isDebug: true
+            });
+
+            const startResult = await this._debuggerTool.execute('start', { file: this._fileName });
+
+            if (!startResult.success) {
+                throw new Error(startResult.error || 'Failed to start debugger');
+            }
+
+            await this._delay(500);
+            await vscode.commands.executeCommand('workbench.view.explorer');
+            await this._explainCurrentState();
+
+        } catch (error) {
+            console.error('Walkthrough start error:', error);
+            this._sendToWebview('receiveMessage', {
+                text: `❌ Error: ${error instanceof Error ? error.message : 'Failed to start walkthrough'}`,
+                isError: true
+            });
+            this._isWalkthroughActive = false;
+            this._sendToWebview('walkthroughEnded', {});
+        } finally {
+            this._sendToWebview('setLoading', { isLoading: false });
+        }
+    }
+
+    private async _explainCurrentState() {
+        if (!this._llmService || !this._isWalkthroughActive) return;
+
+        this._sendToWebview('setLoading', { isLoading: true });
+
+        try {
+            const stateResult = await this._debuggerTool.execute('get_state', {});
+
+            if (!stateResult.success || !stateResult.state) {
+                this._sendToWebview('receiveMessage', {
+                    text: '✅ Program execution complete!',
+                    isDebug: true
+                });
+                await this._endWalkthrough();
+                return;
+            }
+
+            const state = stateResult.state;
+
+            this._sendToWebview('debugState', { state });
+
+            const explainPrompt = `The debugger is now stopped. Here's the current state:
+
+File: ${state.file}
+Current line: ${state.line}
+Function: ${state.function}
+
+Code context:
+${state.sourceCode}
+
+Variables in scope:
+${state.variables.map(v => `- ${v.name} = ${v.value} (${v.type})`).join('\n') || 'No variables yet'}
+
+Full source code for reference:
+\`\`\`
+${this._sourceCode}
+\`\`\`
+
+Please explain in 2-4 sentences:
+1. What line ${state.line} does
+2. What the current variable values mean
+3. What will happen when we execute this line
+
+Keep it educational and encouraging!`;
+
+            const explanation = await this._llmService.chat(
+                [{ role: 'user', content: explainPrompt }],
+                this._systemPrompt
+            );
+
+            this._sendToWebview('receiveMessage', {
+                text: explanation,
+                isDebug: true
+            });
+
+            this._sendToWebview('showStepControls', {});
+            this._updateStepBackButton();
+
+        } catch (error) {
+            console.error('Explain state error:', error);
+            this._sendToWebview('receiveMessage', {
+                text: `❌ Error getting state: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                isError: true
+            });
+        } finally {
+            this._sendToWebview('setLoading', { isLoading: false });
+        }
+    }
+
+    private async _nextStep() {
+        if (!this._isWalkthroughActive) return;
+
+        this._sendToWebview('hideStepControls', {});
+        this._sendToWebview('receiveMessage', {
+            text: '⏭️ Stepping forward...',
+            isDebug: true
+        });
+
+        const result = await this._debuggerTool.execute('step_over', {});
+
+        await vscode.commands.executeCommand('workbench.view.explorer');
+
+        if (!result.success) {
+            if (!this._debuggerTool.getIsDebugging()) {
+                await this._programEnded();
+            } else {
+                this._sendToWebview('receiveMessage', {
+                    text: `❌ Step failed: ${result.error}`,
+                    isError: true
+                });
+                this._sendToWebview('showStepControls', {});
+            }
+            return;
+        }
+
+        await this._delay(300);
+        await this._explainCurrentState();
+    }
+
+    private async _stepBack() {
+        if (!this._isWalkthroughActive) return;
+
+        if (!this._debuggerTool.canStepBack()) {
+            this._sendToWebview('receiveMessage', {
+                text: '⚠️ Cannot step back - already at the beginning.',
+                isError: true
+            });
+            return;
+        }
+
+        this._sendToWebview('hideStepControls', {});
+        this._sendToWebview('receiveMessage', {
+            text: '⏮️ Stepping back...',
+            isDebug: true
+        });
+
+        this._sendToWebview('setLoading', { isLoading: true });
+
+        try {
+            const result = await this._debuggerTool.execute('step_back', {});
+
+            await vscode.commands.executeCommand('workbench.view.explorer');
+
+            if (!result.success) {
+                this._sendToWebview('receiveMessage', {
+                    text: `❌ Step back failed: ${result.error}`,
+                    isError: true
+                });
+                this._sendToWebview('showStepControls', {});
+                return;
+            }
+
+            await this._delay(300);
+            await this._explainCurrentState();
+
+        } catch (error) {
+            this._sendToWebview('receiveMessage', {
+                text: `❌ Step back failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                isError: true
+            });
+            this._sendToWebview('showStepControls', {});
+        } finally {
+            this._sendToWebview('setLoading', { isLoading: false });
+        }
+    }
+
+    private async _programEnded() {
+        if (!this._llmService) return;
+
+        this._sendToWebview('setLoading', { isLoading: true });
+
+        try {
+            const summaryPrompt = `The program has finished executing. 
+
+Here was the code:
+\`\`\`
+${this._sourceCode}
+\`\`\`
+
+Please provide a brief summary (3-4 sentences) of:
+1. What the program did overall
+2. Key concepts the student should remember from this walkthrough
+3. An encouraging closing message
+
+Keep it concise and educational!`;
+
+            const summary = await this._llmService.chat(
+                [{ role: 'user', content: summaryPrompt }],
+                this._systemPrompt
+            );
+
+            this._sendToWebview('receiveMessage', {
+                text: '✅ Program execution complete!\n\n' + summary,
+                isDebug: true
+            });
+
+        } catch (error) {
+            this._sendToWebview('receiveMessage', {
+                text: '✅ Program execution complete!',
+                isDebug: true
+            });
+        } finally {
+            this._sendToWebview('setLoading', { isLoading: false });
+            await this._endWalkthrough();
+        }
+    }
+
+    private async _endWalkthrough() {
+        this._isWalkthroughActive = false;
+        await this._debuggerTool.execute('stop', {});
+        this._sendToWebview('walkthroughEnded', {});
+        this._sendToWebview('hideStepControls', {});
+    }
+
+    private async _handleWalkthroughQuestion(text: string) {
+        if (!this._llmService) return;
+
+        this._sendToWebview('setLoading', { isLoading: true });
+
+        try {
+            const stateResult = await this._debuggerTool.execute('get_state', {});
+            const state = stateResult.state;
+
+            let contextInfo = '';
+            if (state) {
+                contextInfo = `
+Current debug state:
+- Line: ${state.line}
+- Function: ${state.function}
+- Variables: ${state.variables.map(v => `${v.name}=${v.value}`).join(', ') || 'none'}
+`;
+            }
+
+            const questionPrompt = `The student is debugging this code:
+\`\`\`
+${this._sourceCode}
+\`\`\`
+${contextInfo}
+Student's question: ${text}
+
+Please answer their question helpfully and concisely.`;
+
+            const response = await this._llmService.chat(
+                [{ role: 'user', content: questionPrompt }],
+                this._systemPrompt
+            );
+
+            this._sendToWebview('receiveMessage', {
+                text: response,
+                isDebug: true
+            });
+
+        } catch (error) {
+            this._sendToWebview('receiveMessage', {
+                text: `❌ Error: ${error instanceof Error ? error.message : 'Failed to answer'}`,
+                isError: true
+            });
+        } finally {
+            this._sendToWebview('setLoading', { isLoading: false });
+        }
+    }
+
+    private async _stopDebugWalkthrough() {
+        this._sendToWebview('receiveMessage', {
+            text: '🛑 Debug walkthrough stopped.',
+            isDebug: true
+        });
+        await this._endWalkthrough();
     }
 
     private async _handleUserMessage(text: string) {
@@ -96,17 +470,11 @@ Your goal is to help students learn programming concepts clearly and effectively
             return;
         }
 
-        // Add user message to history
         this._chatHistory.push({ role: 'user', content: text });
-
-        // Show loading state
         this._sendToWebview('setLoading', { isLoading: true });
 
         try {
-            // Use streaming for better UX
             let fullResponse = '';
-            
-            // Create a placeholder for the streaming response
             this._sendToWebview('startStream', {});
 
             for await (const chunk of this._llmService.chatStream(this._chatHistory, this._systemPrompt)) {
@@ -115,8 +483,6 @@ Your goal is to help students learn programming concepts clearly and effectively
             }
 
             this._sendToWebview('endStream', {});
-
-            // Add assistant response to history
             this._chatHistory.push({ role: 'assistant', content: fullResponse });
 
         } catch (error) {
@@ -134,6 +500,10 @@ Your goal is to help students learn programming concepts clearly and effectively
         if (this._view) {
             this._view.webview.postMessage({ command, ...data });
         }
+    }
+
+    private _delay(ms: number): Promise<void> {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     private _getHtmlContent(): string {
@@ -185,6 +555,31 @@ Your goal is to help students learn programming concepts clearly and effectively
                     .icon-btn:hover {
                         opacity: 1;
                     }
+                    .debug-btn {
+                        background-color: var(--vscode-button-background);
+                        color: var(--vscode-button-foreground);
+                        border: none;
+                        border-radius: 4px;
+                        padding: 4px 8px;
+                        cursor: pointer;
+                        font-size: 12px;
+                        display: flex;
+                        align-items: center;
+                        gap: 4px;
+                    }
+                    .debug-btn:hover {
+                        background-color: var(--vscode-button-hoverBackground);
+                    }
+                    .debug-btn.stop {
+                        background-color: #c42b1c;
+                        color: white;
+                    }
+                    .debug-btn.stop:hover {
+                        background-color: #a61b0f;
+                    }
+                    .debug-btn.hidden {
+                        display: none;
+                    }
                     .chat-container {
                         flex: 1;
                         overflow-y: auto;
@@ -197,6 +592,7 @@ Your goal is to help students learn programming concepts clearly and effectively
                         max-width: 90%;
                         white-space: pre-wrap;
                         word-wrap: break-word;
+                        color: var(--vscode-foreground);
                     }
                     .message.user {
                         background-color: var(--vscode-button-background);
@@ -206,10 +602,104 @@ Your goal is to help students learn programming concepts clearly and effectively
                     .message.assistant {
                         background-color: var(--vscode-editor-background);
                         border: 1px solid var(--vscode-panel-border);
+                        color: var(--vscode-editor-foreground);
+                    }
+                    .message.debug {
+                        background-color: var(--vscode-editor-background);
+                        border-left: 3px solid #4ec9b0;
+                        color: var(--vscode-editor-foreground);
                     }
                     .message.error {
-                        background-color: var(--vscode-inputValidation-errorBackground);
-                        border: 1px solid var(--vscode-inputValidation-errorBorder);
+                        background-color: rgba(244, 67, 54, 0.1);
+                        border: 1px solid #f44336;
+                        color: var(--vscode-foreground);
+                    }
+                    .debug-state {
+                        background-color: var(--vscode-editor-background);
+                        border: 1px solid #4ec9b0;
+                        border-radius: 8px;
+                        padding: 12px;
+                        margin-bottom: 12px;
+                        font-family: var(--vscode-editor-font-family), monospace;
+                        font-size: 12px;
+                        color: var(--vscode-editor-foreground);
+                    }
+                    .debug-state-header {
+                        font-weight: bold;
+                        margin-bottom: 8px;
+                        color: #4ec9b0;
+                    }
+                    .debug-state-section {
+                        margin-bottom: 8px;
+                    }
+                    .debug-state-section h4 {
+                        font-size: 11px;
+                        color: var(--vscode-descriptionForeground);
+                        margin-bottom: 4px;
+                    }
+                    .debug-state-code {
+                        background-color: var(--vscode-textCodeBlock-background);
+                        padding: 8px;
+                        border-radius: 4px;
+                        overflow-x: auto;
+                        color: var(--vscode-editor-foreground);
+                    }
+                    .debug-state-code pre {
+                        margin: 0;
+                        font-family: var(--vscode-editor-font-family), monospace;
+                    }
+                    .debug-state-vars {
+                        display: grid;
+                        grid-template-columns: auto 1fr;
+                        gap: 4px 12px;
+                    }
+                    .var-name {
+                        color: #9cdcfe;
+                    }
+                    .var-value {
+                        color: #ce9178;
+                    }
+                    .var-value small {
+                        color: var(--vscode-descriptionForeground);
+                    }
+                    .step-controls {
+                        display: flex;
+                        gap: 8px;
+                        padding: 12px;
+                        border-top: 1px solid var(--vscode-panel-border);
+                        background-color: var(--vscode-sideBar-background);
+                        justify-content: center;
+                    }
+                    .step-controls.hidden {
+                        display: none;
+                    }
+                    .step-btn {
+                        background-color: var(--vscode-button-secondaryBackground);
+                        color: var(--vscode-button-secondaryForeground);
+                        border: none;
+                        border-radius: 4px;
+                        padding: 8px 16px;
+                        cursor: pointer;
+                        font-size: 13px;
+                        display: flex;
+                        align-items: center;
+                        gap: 6px;
+                        flex: 1;
+                        justify-content: center;
+                    }
+                    .step-btn:hover:not(:disabled) {
+                        background-color: var(--vscode-button-secondaryHoverBackground);
+                    }
+                    .step-btn:disabled {
+                        opacity: 0.4;
+                        cursor: not-allowed;
+                    }
+                    .step-btn.primary {
+                        background-color: var(--vscode-button-background);
+                        color: var(--vscode-button-foreground);
+                    }
+                    .step-btn.primary:hover:not(:disabled) {
+                        background-color: var(--vscode-button-hoverBackground);
                     }
                     .input-container {
                         padding: 12px;
@@ -271,20 +761,18 @@ Your goal is to help students learn programming concepts clearly and effectively
                         0%, 80%, 100% { transform: scale(0); }
                         40% { transform: scale(1); }
                     }
-                    .provider-badge {
-                        font-size: 10px;
-                        padding: 2px 6px;
-                        border-radius: 4px;
-                        background-color: var(--vscode-badge-background);
-                        color: var(--vscode-badge-foreground);
-                        margin-left: 8px;
-                    }
                 </style>
             </head>
             <body>
                 <div class="header">
                     <h2>🎓 LLMentor</h2>
                     <div class="header-buttons">
+                        <button class="debug-btn" id="startDebugBtn" title="Start AI Debug Walkthrough">
+                            🔍 Debug with AI
+                        </button>
+                        <button class="debug-btn stop hidden" id="stopDebugBtn" title="Stop Debug Walkthrough">
+                            🛑 Stop
+                        </button>
                         <button class="icon-btn" id="settingsBtn" title="Settings">⚙️</button>
                         <button class="icon-btn" id="clearBtn" title="Clear Chat">🗑️</button>
                     </div>
@@ -295,15 +783,27 @@ Your goal is to help students learn programming concepts clearly and effectively
                         <p>👋 Hi! I'm your AI programming tutor.</p>
                         <p style="margin-top: 8px;">Ask me anything about code!</p>
                         <p style="margin-top: 16px; font-size: 12px;">
+                            Click <strong>🔍 Debug with AI</strong> to walk through your code step by step
+                        </p>
+                        <p style="margin-top: 8px; font-size: 12px;">
                             Click ⚙️ to configure your AI provider
                         </p>
                     </div>
+                </div>
+
+                <div class="step-controls hidden" id="stepControls">
+                    <button class="step-btn" id="stepBackBtn" disabled title="Go back to previous step">
+                        ⏮️ Step Back
+                    </button>
+                    <button class="step-btn primary" id="nextStepBtn" title="Execute current line and move to next">
+                        ⏭️ Step Over
+                    </button>
                 </div>
                 
                 <div class="input-container">
                     <textarea 
                         id="messageInput" 
-                        placeholder="Type a message..."
+                        placeholder="Type a message or ask a question..."
                         rows="1"
                     ></textarea>
                     <button id="sendButton">Send</button>
@@ -316,13 +816,73 @@ Your goal is to help students learn programming concepts clearly and effectively
                     const sendButton = document.getElementById('sendButton');
                     const clearBtn = document.getElementById('clearBtn');
                     const settingsBtn = document.getElementById('settingsBtn');
+                    const startDebugBtn = document.getElementById('startDebugBtn');
+                    const stopDebugBtn = document.getElementById('stopDebugBtn');
+                    const stepControls = document.getElementById('stepControls');
+                    const nextStepBtn = document.getElementById('nextStepBtn');
+                    const stepBackBtn = document.getElementById('stepBackBtn');
 
                     let isLoading = false;
                     let currentStreamingMessage = null;
+                    let isWalkthroughActive = false;
+
+                    let state = vscode.getState() || { 
+                        messages: [], 
+                        isWalkthroughActive: false,
+                        showStepControls: false,
+                        canStepBack: false
+                    };
+
+                    function restoreState() {
+                        if (state.messages && state.messages.length > 0) {
+                            chatContainer.innerHTML = '';
+                            
+                            for (const msg of state.messages) {
+                                if (msg.type === 'debugState') {
+                                    addDebugStateFromData(msg.data);
+                                } else {
+                                    addMessageWithoutSaving(msg.text, msg.msgType, msg.isError, msg.isDebug);
+                                }
+                            }
+                        }
+                        
+                        if (state.isWalkthroughActive) {
+                            isWalkthroughActive = true;
+                            startDebugBtn.classList.add('hidden');
+                            stopDebugBtn.classList.remove('hidden');
+                        }
+                        
+                        if (state.showStepControls) {
+                            stepControls.classList.remove('hidden');
+                        }
+
+                        stepBackBtn.disabled = !state.canStepBack;
+                    }
+
+                    function saveState() {
+                        vscode.setState(state);
+                    }
+
+                    function addMessageToState(text, msgType, isError = false, isDebug = false) {
+                        state.messages.push({ text, msgType, isError, isDebug, type: 'message' });
+                        saveState();
+                    }
+
+                    function addDebugStateToState(data) {
+                        state.messages.push({ type: 'debugState', data });
+                        saveState();
+                    }
+
+                    restoreState();
+                    vscode.postMessage({ command: 'ready' });
 
                     sendButton.addEventListener('click', sendMessage);
                     clearBtn.addEventListener('click', clearChat);
                     settingsBtn.addEventListener('click', openSettings);
+                    startDebugBtn.addEventListener('click', startDebugWalkthrough);
+                    stopDebugBtn.addEventListener('click', stopDebugWalkthrough);
+                    nextStepBtn.addEventListener('click', () => vscode.postMessage({ command: 'nextStep' }));
+                    stepBackBtn.addEventListener('click', () => vscode.postMessage({ command: 'stepBack' }));
                     
                     messageInput.addEventListener('keydown', (e) => {
                         if (e.key === 'Enter' && !e.shiftKey) {
@@ -331,7 +891,6 @@ Your goal is to help students learn programming concepts clearly and effectively
                         }
                     });
 
-                    // Auto-resize textarea
                     messageInput.addEventListener('input', () => {
                         messageInput.style.height = 'auto';
                         messageInput.style.height = messageInput.scrollHeight + 'px';
@@ -359,10 +918,18 @@ Your goal is to help students learn programming concepts clearly and effectively
                                 <p>👋 Hi! I'm your AI programming tutor.</p>
                                 <p style="margin-top: 8px;">Ask me anything about code!</p>
                                 <p style="margin-top: 16px; font-size: 12px;">
+                                    Click <strong>🔍 Debug with AI</strong> to walk through your code step by step
+                                </p>
+                                <p style="margin-top: 8px; font-size: 12px;">
                                     Click ⚙️ to configure your AI provider
                                 </p>
                             </div>
                         \`;
+                        stepControls.classList.add('hidden');
+                        
+                        state = { messages: [], isWalkthroughActive: false, showStepControls: false, canStepBack: false };
+                        saveState();
+                        
                         vscode.postMessage({ command: 'clearChat' });
                     }
 
@@ -370,15 +937,75 @@ Your goal is to help students learn programming concepts clearly and effectively
                         vscode.postMessage({ command: 'openSettings' });
                     }
 
-                    function addMessage(text, type, isError = false) {
+                    function startDebugWalkthrough() {
+                        vscode.postMessage({ command: 'startDebugWalkthrough' });
+                    }
+
+                    function stopDebugWalkthrough() {
+                        vscode.postMessage({ command: 'stopDebugWalkthrough' });
+                    }
+
+                    function addMessageWithoutSaving(text, type, isError = false, isDebug = false) {
                         removeWelcome();
 
                         const messageDiv = document.createElement('div');
-                        messageDiv.className = 'message ' + type + (isError ? ' error' : '');
+                        let className = 'message ' + type;
+                        if (isError) className += ' error';
+                        if (isDebug && type === 'assistant') className += ' debug';
+                        messageDiv.className = className;
                         messageDiv.textContent = text;
                         chatContainer.appendChild(messageDiv);
                         scrollToBottom();
                         return messageDiv;
+                    }
+
+                    function addMessage(text, type, isError = false, isDebug = false) {
+                        const messageDiv = addMessageWithoutSaving(text, type, isError, isDebug);
+                        addMessageToState(text, type, isError, isDebug);
+                        return messageDiv;
+                    }
+
+                    function addDebugStateFromData(stateData) {
+                        removeWelcome();
+
+                        const stateDiv = document.createElement('div');
+                        stateDiv.className = 'debug-state';
+
+                        let html = '<div class="debug-state-header">📍 Stopped at Line ' + stateData.line + '</div>';
+
+                        if (stateData.sourceCode) {
+                            html += '<div class="debug-state-section">';
+                            html += '<h4>Code</h4>';
+                            html += '<div class="debug-state-code"><pre>' + escapeHtml(stateData.sourceCode) + '</pre></div>';
+                            html += '</div>';
+                        }
+
+                        if (stateData.variables && stateData.variables.length > 0) {
+                            html += '<div class="debug-state-section">';
+                            html += '<h4>Variables</h4>';
+                            html += '<div class="debug-state-vars">';
+                            for (const v of stateData.variables) {
+                                html += '<span class="var-name">' + escapeHtml(v.name) + '</span>';
+                                html += '<span class="var-value">' + escapeHtml(v.value) + ' <small>(' + escapeHtml(v.type) + ')</small></span>';
+                            }
+                            html += '</div>';
+                            html += '</div>';
+                        }
+
+                        stateDiv.innerHTML = html;
+                        chatContainer.appendChild(stateDiv);
+                        scrollToBottom();
+                    }
+
+                    function addDebugState(stateData) {
+                        addDebugStateFromData(stateData);
+                        addDebugStateToState(stateData);
+                    }
+
+                    function escapeHtml(text) {
+                        const div = document.createElement('div');
+                        div.textContent = text;
+                        return div.innerHTML;
                     }
 
                     function removeWelcome() {
@@ -405,13 +1032,12 @@ Your goal is to help students learn programming concepts clearly and effectively
                         chatContainer.scrollTop = chatContainer.scrollHeight;
                     }
 
-                    // Handle messages from extension
                     window.addEventListener('message', (event) => {
                         const message = event.data;
                         
                         switch (message.command) {
                             case 'receiveMessage':
-                                addMessage(message.text, 'assistant', message.isError);
+                                addMessage(message.text, 'assistant', message.isError, message.isDebug);
                                 break;
                             
                             case 'setLoading':
@@ -426,7 +1052,7 @@ Your goal is to help students learn programming concepts clearly and effectively
                             
                             case 'startStream':
                                 hideLoading();
-                                currentStreamingMessage = addMessage('', 'assistant');
+                                currentStreamingMessage = addMessageWithoutSaving('', 'assistant');
                                 break;
                             
                             case 'streamChunk':
@@ -437,7 +1063,54 @@ Your goal is to help students learn programming concepts clearly and effectively
                                 break;
                             
                             case 'endStream':
+                                if (currentStreamingMessage) {
+                                    addMessageToState(currentStreamingMessage.textContent, 'assistant', false, false);
+                                }
                                 currentStreamingMessage = null;
+                                break;
+
+                            case 'walkthroughStarted':
+                                isWalkthroughActive = true;
+                                startDebugBtn.classList.add('hidden');
+                                stopDebugBtn.classList.remove('hidden');
+                                state.isWalkthroughActive = true;
+                                saveState();
+                                break;
+
+                            case 'walkthroughEnded':
+                                isWalkthroughActive = false;
+                                startDebugBtn.classList.remove('hidden');
+                                stopDebugBtn.classList.add('hidden');
+                                stepControls.classList.add('hidden');
+                                state.isWalkthroughActive = false;
+                                state.showStepControls = false;
+                                state.canStepBack = false;
+                                saveState();
+                                break;
+
+                            case 'debugState':
+                                if (message.state) {
+                                    addDebugState(message.state);
+                                }
+                                break;
+
+                            case 'showStepControls':
+                                stepControls.classList.remove('hidden');
+                                state.showStepControls = true;
+                                saveState();
+                                scrollToBottom();
+                                break;
+
+                            case 'hideStepControls':
+                                stepControls.classList.add('hidden');
+                                state.showStepControls = false;
+                                saveState();
+                                break;
+
+                            case 'updateStepBackState':
+                                stepBackBtn.disabled = !message.canStepBack;
+                                state.canStepBack = message.canStepBack;
+                                saveState();
                                 break;
                         }
                     });

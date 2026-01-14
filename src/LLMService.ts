@@ -1,20 +1,36 @@
 import { ChatOllama } from '@langchain/ollama';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatOpenAI } from '@langchain/openai';
-import { HumanMessage, AIMessage, SystemMessage, BaseMessage } from '@langchain/core/messages';
+import { HumanMessage, AIMessage, SystemMessage, BaseMessage, ToolMessage } from '@langchain/core/messages';
+import { tool } from '@langchain/core/tools';
+import { z } from 'zod';
 
 export type LLMProvider = 'ollama' | 'anthropic' | 'openai';
 
 export interface LLMConfig {
     provider: LLMProvider;
     model: string;
-    apiKey?: string;        // For paid APIs
-    baseUrl?: string;       // For Ollama (default: http://localhost:11434)
+    apiKey?: string;
+    baseUrl?: string;
 }
 
 export interface ChatMessage {
-    role: 'user' | 'assistant' | 'system';
+    role: 'user' | 'assistant' | 'system' | 'tool';
     content: string;
+    toolCallId?: string;
+    toolCalls?: ToolCall[];
+}
+
+export interface ToolCall {
+    id: string;
+    name: string;
+    args: any;
+}
+
+export interface ToolDefinition {
+    name: string;
+    description: string;
+    parameters: any;
 }
 
 export class LLMService {
@@ -77,7 +93,22 @@ export class LLMService {
                 case 'user':
                     return new HumanMessage(msg.content);
                 case 'assistant':
+                    if (msg.toolCalls && msg.toolCalls.length > 0) {
+                        return new AIMessage({
+                            content: msg.content,
+                            tool_calls: msg.toolCalls.map(tc => ({
+                                id: tc.id,
+                                name: tc.name,
+                                args: tc.args
+                            }))
+                        });
+                    }
                     return new AIMessage(msg.content);
+                case 'tool':
+                    return new ToolMessage({
+                        content: msg.content,
+                        tool_call_id: msg.toolCallId || ''
+                    });
                 default:
                     return new HumanMessage(msg.content);
             }
@@ -91,7 +122,6 @@ export class LLMService {
 
         const allMessages: ChatMessage[] = [];
 
-        // Add system prompt if provided
         if (systemPrompt) {
             allMessages.push({ role: 'system', content: systemPrompt });
         }
@@ -109,7 +139,6 @@ export class LLMService {
         }
     }
 
-    // Streaming version for better UX
     public async *chatStream(messages: ChatMessage[], systemPrompt?: string): AsyncGenerator<string> {
         if (!this.llm) {
             throw new Error('LLM not initialized');
@@ -134,6 +163,75 @@ export class LLMService {
             }
         } catch (error) {
             console.error('LLM Stream Error:', error);
+            throw error;
+        }
+    }
+
+    public async chatWithTools(
+        messages: ChatMessage[],
+        systemPrompt: string,
+        tools: ToolDefinition[]
+    ): Promise<{ content: string; toolCalls?: ToolCall[] }> {
+        if (!this.llm) {
+            throw new Error('LLM not initialized');
+        }
+
+        const allMessages: ChatMessage[] = [
+            { role: 'system', content: systemPrompt },
+            ...messages
+        ];
+
+        const langChainMessages = this.convertToLangChainMessages(allMessages);
+
+        // Convert tool definitions to LangChain format
+        const langChainTools = tools.map(t => {
+            const schemaObj: any = {};
+            if (t.parameters.properties) {
+                for (const [key, value] of Object.entries(t.parameters.properties)) {
+                    const prop = value as any;
+                    if (prop.type === 'string') {
+                        schemaObj[key] = prop.enum
+                            ? z.enum(prop.enum).optional().describe(prop.description || '')
+                            : z.string().optional().describe(prop.description || '');
+                    } else if (prop.type === 'number') {
+                        schemaObj[key] = z.number().optional().describe(prop.description || '');
+                    } else if (prop.type === 'array') {
+                        schemaObj[key] = z.array(z.number()).optional().describe(prop.description || '');
+                    }
+                }
+            }
+
+            return tool(
+                async (input) => JSON.stringify(input),
+                {
+                    name: t.name,
+                    description: t.description,
+                    schema: z.object(schemaObj)
+                }
+            );
+        });
+
+        try {
+            const llmWithTools = this.llm.bindTools(langChainTools);
+            const response = await llmWithTools.invoke(langChainMessages);
+
+            const toolCalls: ToolCall[] = [];
+            if (response.tool_calls && response.tool_calls.length > 0) {
+                for (const tc of response.tool_calls) {
+                    toolCalls.push({
+                        id: tc.id || `call_${Date.now()}`,
+                        name: tc.name,
+                        args: tc.args
+                    });
+                }
+            }
+
+            return {
+                content: response.content as string,
+                toolCalls: toolCalls.length > 0 ? toolCalls : undefined
+            };
+        } catch (error) {
+            console.error('LLM Tool Error:', error);
             throw error;
         }
     }

@@ -15,70 +15,76 @@
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
-        {
-            "command": "llmentor.sayHello",
-            "title": "LLMentor: Say Hello"
-        },
-        {
-            "command": "llmentor.selectProvider",
-            "title": "LLMentor: Select AI Provider"
-        },
-        {
-            "command": "llmentor.openSettings",
-            "title": "LLMentor: Open Settings"
-        }
+      {
+        "command": "llmentor.sayHello",
+        "title": "LLMentor: Say Hello"
+      },
+      {
+        "command": "llmentor.selectProvider",
+        "title": "LLMentor: Select AI Provider"
+      },
+      {
+        "command": "llmentor.openSettings",
+        "title": "LLMentor: Open Settings"
+      }
     ],
     "views": {
-        "explorer": [
-            {
-                "type": "webview",
-                "id": "llmentor.chatView",
-                "name": "LLMentor Chat"
-            }
-        ]
-    },
-    "configuration": {
-        "title": "LLMentor",
-        "properties": {
-            "llmentor.provider": {
-                "type": "string",
-                "default": "ollama",
-                "enum": ["ollama", "anthropic", "openai"],
-                "enumDescriptions": [
-                    "Use locally running Ollama (free, private)",
-                    "Use Anthropic Claude API (requires API key)",
-                    "Use OpenAI API (requires API key)"
-                ],
-                "description": "Which AI provider to use",
-                "order": 1
-            },
-            "llmentor.model": {
-                "type": "string",
-                "default": "llama3.2",
-                "description": "Model name to use (e.g., llama3.2, claude-3-5-sonnet-20241022, gpt-4o)",
-                "order": 2
-            },
-            "llmentor.ollamaBaseUrl": {
-                "type": "string",
-                "default": "http://localhost:11434",
-                "description": "Ollama server URL (only used when provider is 'ollama')",
-                "order": 3
-            },
-            "llmentor.anthropicApiKey": {
-                "type": "string",
-                "default": "",
-                "description": "Your Anthropic API key (only used when provider is 'anthropic')",
-                "order": 4
-            },
-            "llmentor.openaiApiKey": {
-                "type": "string",
-                "default": "",
-                "description": "Your OpenAI API key (only used when provider is 'openai')",
-                "order": 5
-            }
+    "explorer": [
+        {
+            "type": "webview",
+            "id": "llmentor.chatView",
+            "name": "LLMentor Chat",
+            "contextualTitle": "LLMentor",
+            "retainContextWhenHidden": true
         }
+    ]
+},
+    "configuration": {
+      "title": "LLMentor",
+      "properties": {
+        "llmentor.provider": {
+          "type": "string",
+          "default": "ollama",
+          "enum": [
+            "ollama",
+            "anthropic",
+            "openai"
+          ],
+          "enumDescriptions": [
+            "Use locally running Ollama (free, private)",
+            "Use Anthropic Claude API (requires API key)",
+            "Use OpenAI API (requires API key)"
+          ],
+          "description": "Which AI provider to use",
+          "order": 1
+        },
+        "llmentor.model": {
+          "type": "string",
+          "default": "llama3.2",
+          "description": "Model name to use (e.g., llama3.2, claude-3-5-sonnet-20241022, gpt-4o)",
+          "order": 2
+        },
+        "llmentor.ollamaBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama server URL (only used when provider is 'ollama')",
+          "order": 3
+        },
+        "llmentor.anthropicApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Your Anthropic API key (only used when provider is 'anthropic')",
+          "order": 4
+        },
+        "llmentor.openaiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Your OpenAI API key (only used when provider is 'openai')",
+          "order": 5
+        }
+      }
     }
-    },
+  },
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
@@ -102,6 +108,7 @@
     "@langchain/core": "^1.1.13",
     "@langchain/ollama": "^1.2.0",
     "@langchain/openai": "^1.2.2",
-    "langchain": "^1.2.8"
+    "langchain": "^1.2.8",
+    "zod": "^4.3.5"
   }
 }
