@@ -13,9 +13,27 @@ export function activate(context: vscode.ExtensionContext) {
         )
     );
 
-    // Keep the hello command
-    const helloCommand = vscode.commands.registerCommand('llmentor.sayHello', () => {
-        vscode.window.showInformationMessage('Hello from LLMentor! 🎉');
+    // Command to open settings directly
+    const openSettings = vscode.commands.registerCommand('llmentor.openSettings', () => {
+        vscode.commands.executeCommand('workbench.action.openSettings', '@ext:undefined_publisher.llmentor');
+    });
+
+    // Command to quickly select provider
+    const selectProvider = vscode.commands.registerCommand('llmentor.selectProvider', async () => {
+        const choice = await vscode.window.showQuickPick(
+            [
+                { label: '$(server) Ollama (Local)', value: 'ollama', description: 'Free, runs locally' },
+                { label: '$(cloud) Anthropic (Claude)', value: 'anthropic', description: 'Requires API key' },
+                { label: '$(cloud) OpenAI', value: 'openai', description: 'Requires API key' }
+            ],
+            { placeHolder: 'Select AI Provider' }
+        );
+
+        if (choice) {
+            const config = vscode.workspace.getConfiguration('llmentor');
+            await config.update('provider', choice.value, vscode.ConfigurationTarget.Global);
+            vscode.window.showInformationMessage(`LLMentor: Switched to ${choice.label}`);
+        }
     });
 
     // Status bar button
@@ -24,11 +42,12 @@ export function activate(context: vscode.ExtensionContext) {
         100
     );
     statusBarButton.text = '$(mortar-board) LLMentor';
-    statusBarButton.tooltip = 'Click me!';
-    statusBarButton.command = 'llmentor.sayHello';
+    statusBarButton.tooltip = 'Select AI Provider';
+    statusBarButton.command = 'llmentor.selectProvider';
     statusBarButton.show();
 
-    context.subscriptions.push(helloCommand);
+    context.subscriptions.push(openSettings);
+    context.subscriptions.push(selectProvider);
     context.subscriptions.push(statusBarButton);
 }
 
