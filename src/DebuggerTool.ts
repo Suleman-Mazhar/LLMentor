@@ -35,8 +35,13 @@ export class DebuggerTool {
     
     // For step back functionality
     private stateHistory: DebugState[] = [];
-    private breakpointLines: number[] = [];
     private currentFile: string = '';
+    
+    // For targeted debugging
+    private targetStartLine: number = 0;
+    private targetEndLine: number = 0;
+    private isTargetedMode: boolean = false;
+    private targetedBreakpoints: vscode.SourceBreakpoint[] = [];
 
     constructor() {
         vscode.debug.onDidChangeActiveStackItem(() => {
@@ -49,7 +54,10 @@ export class DebuggerTool {
         vscode.debug.onDidTerminateDebugSession(() => {
             this.isDebugging = false;
             this.stateHistory = [];
-            this.breakpointLines = [];
+            this.clearTargetedBreakpoints();
+            this.isTargetedMode = false;
+            this.targetStartLine = 0;
+            this.targetEndLine = 0;
         });
     }
 
@@ -65,11 +73,41 @@ export class DebuggerTool {
         return this.stateHistory.length;
     }
 
+    public isInTargetedMode(): boolean {
+        return this.isTargetedMode;
+    }
+
+    public getTargetRange(): { start: number; end: number } {
+        return { start: this.targetStartLine, end: this.targetEndLine };
+    }
+
+    public setTargetedMode(startLine: number, endLine: number) {
+        this.isTargetedMode = true;
+        this.targetStartLine = startLine;
+        this.targetEndLine = endLine;
+    }
+
+    public clearTargetedMode() {
+        this.isTargetedMode = false;
+        this.targetStartLine = 0;
+        this.targetEndLine = 0;
+        this.clearTargetedBreakpoints();
+    }
+
+    private clearTargetedBreakpoints() {
+        if (this.targetedBreakpoints.length > 0) {
+            vscode.debug.removeBreakpoints(this.targetedBreakpoints);
+            this.targetedBreakpoints = [];
+        }
+    }
+
     public async execute(action: string, params?: any): Promise<ToolResult> {
         try {
             switch (action) {
                 case 'start':
                     return await this.startDebugging(params?.file);
+                case 'start_targeted':
+                    return await this.startTargetedDebugging(params?.file, params?.startLine, params?.endLine);
                 case 'set_breakpoints':
                     return await this.setBreakpoints(params?.file, params?.lines);
                 case 'step_over':
@@ -82,6 +120,8 @@ export class DebuggerTool {
                     return await this.stepOut();
                 case 'continue':
                     return await this.continueExecution();
+                case 'continue_to_line':
+                    return await this.continueToLine(params?.line);
                 case 'get_variables':
                     return await this.getVariables();
                 case 'get_call_stack':
@@ -112,7 +152,7 @@ export class DebuggerTool {
 
         this.currentFile = file;
         this.stateHistory = [];
-        this.breakpointLines = [];
+        this.clearTargetedMode();
 
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
         const config = this.getDebugConfig(file);
@@ -123,7 +163,6 @@ export class DebuggerTool {
             this.isDebugging = true;
             await this.waitForStop(2000);
             
-            // Save initial state
             const stateResult = await this.getFullState();
             if (stateResult.state) {
                 this.stateHistory.push(stateResult.state);
@@ -133,6 +172,70 @@ export class DebuggerTool {
         }
 
         return { success: false, error: 'Failed to start debug session' };
+    }
+
+    private async startTargetedDebugging(
+        filePath: string,
+        startLine: number,
+        endLine: number
+    ): Promise<ToolResult> {
+        this.currentFile = filePath;
+        this.stateHistory = [];
+        this.setTargetedMode(startLine, endLine);
+
+        // Clear any existing breakpoints in this file
+        const existingBps = vscode.debug.breakpoints.filter(bp => {
+            if (bp instanceof vscode.SourceBreakpoint) {
+                return bp.location.uri.fsPath === filePath;
+            }
+            return false;
+        });
+        vscode.debug.removeBreakpoints(existingBps);
+
+        // Set breakpoints at ALL lines in the target range (visible red dots)
+        const uri = vscode.Uri.file(filePath);
+        this.targetedBreakpoints = [];
+        
+        for (let line = startLine; line <= endLine; line++) {
+            const location = new vscode.Location(uri, new vscode.Position(line - 1, 0));
+            const breakpoint = new vscode.SourceBreakpoint(location);
+            this.targetedBreakpoints.push(breakpoint);
+        }
+        
+        // Add all the breakpoints (red dots will appear)
+        vscode.debug.addBreakpoints(this.targetedBreakpoints);
+
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        const config = this.getDebugConfig(filePath);
+        
+        // Don't stop on entry for targeted debugging - we want to run to our breakpoints
+        config.stopOnEntry = false;
+
+        const started = await vscode.debug.startDebugging(workspaceFolder, config);
+
+        if (started) {
+            this.isDebugging = true;
+            // Wait for debugger to hit the first breakpoint
+            await this.waitForStop(10000);
+            
+            const stateResult = await this.getFullState();
+            if (stateResult.state) {
+                this.stateHistory.push(stateResult.state);
+            }
+            
+            return { 
+                success: true, 
+                data: { 
+                    message: `Debug session started at line ${startLine}`,
+                    targetedMode: true,
+                    targetStart: startLine,
+                    targetEnd: endLine
+                }, 
+                state: stateResult.state 
+            };
+        }
+
+        return { success: false, error: 'Failed to start targeted debug session' };
     }
 
     private getDebugConfig(filePath: string): vscode.DebugConfiguration {
@@ -198,7 +301,6 @@ export class DebuggerTool {
             vscode.debug.removeBreakpoints(existingBps);
 
             vscode.debug.addBreakpoints(breakpoints);
-            this.breakpointLines = lines;
 
             return {
                 success: true,
@@ -220,9 +322,23 @@ export class DebuggerTool {
         
         const result = await this.getFullState();
         
-        // Save state to history
         if (result.state) {
             this.stateHistory.push(result.state);
+            
+            // Check if we've passed the target end line in targeted mode
+            if (this.isTargetedMode && result.state.line > this.targetEndLine) {
+                // Clear the targeted breakpoints when we exit the section
+                this.clearTargetedBreakpoints();
+                
+                return {
+                    ...result,
+                    data: { 
+                        ...result.data, 
+                        targetComplete: true,
+                        message: 'Completed target section'
+                    }
+                };
+            }
         }
         
         return result;
@@ -233,18 +349,36 @@ export class DebuggerTool {
             return { success: false, error: 'Cannot step back - at the beginning' };
         }
 
-        // Remove current state
         this.stateHistory.pop();
         
-        // Get the target state (the previous one)
         const targetState = this.stateHistory[this.stateHistory.length - 1];
         const targetLine = targetState.line;
 
-        // Stop current session
+        // Store targeted mode state
+        const wasTargetedMode = this.isTargetedMode;
+        const savedStartLine = this.targetStartLine;
+        const savedEndLine = this.targetEndLine;
+
         await this.stopDebugging();
         await this.delay(300);
 
-        // Restart debugging
+        // If we were in targeted mode, restart with targeted debugging
+        if (wasTargetedMode) {
+            this.setTargetedMode(savedStartLine, savedEndLine);
+            
+            // Re-add the targeted breakpoints
+            const uri = vscode.Uri.file(this.currentFile);
+            this.targetedBreakpoints = [];
+            
+            for (let line = savedStartLine; line <= savedEndLine; line++) {
+                const location = new vscode.Location(uri, new vscode.Position(line - 1, 0));
+                const breakpoint = new vscode.SourceBreakpoint(location);
+                this.targetedBreakpoints.push(breakpoint);
+            }
+            
+            vscode.debug.addBreakpoints(this.targetedBreakpoints);
+        }
+
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
         const config = this.getDebugConfig(this.currentFile);
         
@@ -257,14 +391,13 @@ export class DebuggerTool {
         this.isDebugging = true;
         await this.waitForStop(2000);
 
-        // Step forward until we reach the target line
         const session = vscode.debug.activeDebugSession;
         if (!session) {
             return { success: false, error: 'No active debug session after restart' };
         }
 
         let currentLine = 0;
-        let maxSteps = 1000; // Safety limit
+        let maxSteps = 1000;
         let steps = 0;
 
         while (steps < maxSteps) {
@@ -279,7 +412,6 @@ export class DebuggerTool {
             await this.waitForStop(500);
             steps++;
 
-            // Check if debugging ended
             if (!this.isDebugging || !vscode.debug.activeDebugSession) {
                 return { success: false, error: 'Program ended before reaching target line' };
             }
@@ -333,6 +465,34 @@ export class DebuggerTool {
         await session.customRequest('continue', { threadId: this.currentThreadId });
         await this.waitForStop();
         
+        const result = await this.getFullState();
+        
+        if (result.state) {
+            this.stateHistory.push(result.state);
+        }
+        
+        return result;
+    }
+
+    private async continueToLine(targetLine: number): Promise<ToolResult> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            return { success: false, error: 'No active debug session' };
+        }
+
+        // Set a temporary breakpoint at the target line
+        const uri = vscode.Uri.file(this.currentFile);
+        const location = new vscode.Location(uri, new vscode.Position(targetLine - 1, 0));
+        const tempBreakpoint = new vscode.SourceBreakpoint(location);
+        vscode.debug.addBreakpoints([tempBreakpoint]);
+
+        // Continue execution
+        await session.customRequest('continue', { threadId: this.currentThreadId });
+        await this.waitForStop(10000);
+
+        // Remove the temporary breakpoint
+        vscode.debug.removeBreakpoints([tempBreakpoint]);
+
         const result = await this.getFullState();
         
         if (result.state) {
@@ -525,6 +685,8 @@ export class DebuggerTool {
             await vscode.debug.stopDebugging(session);
         }
         this.isDebugging = false;
+        this.clearTargetedBreakpoints();
+        this.clearTargetedMode();
         return { success: true, data: { message: 'Debug session stopped' } };
     }
 

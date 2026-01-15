@@ -2,8 +2,6 @@ import { ChatOllama } from '@langchain/ollama';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage, AIMessage, SystemMessage, BaseMessage, ToolMessage } from '@langchain/core/messages';
-import { tool } from '@langchain/core/tools';
-import { z } from 'zod';
 
 export type LLMProvider = 'ollama' | 'anthropic' | 'openai';
 
@@ -27,10 +25,12 @@ export interface ToolCall {
     args: any;
 }
 
-export interface ToolDefinition {
-    name: string;
-    description: string;
-    parameters: any;
+export interface TargetedSection {
+    understood: boolean;
+    concept: string;
+    startLine: number;
+    endLine: number;
+    explanation: string;
 }
 
 export class LLMService {
@@ -167,72 +167,67 @@ export class LLMService {
         }
     }
 
-    public async chatWithTools(
-        messages: ChatMessage[],
-        systemPrompt: string,
-        tools: ToolDefinition[]
-    ): Promise<{ content: string; toolCalls?: ToolCall[] }> {
+    public async identifyTargetedSection(
+        code: string,
+        question: string,
+        fileName: string
+    ): Promise<TargetedSection | null> {
         if (!this.llm) {
             throw new Error('LLM not initialized');
         }
 
-        const allMessages: ChatMessage[] = [
-            { role: 'system', content: systemPrompt },
-            ...messages
-        ];
+        const prompt = `You are a code analyzer. A student is asking about a specific part of their code.
 
-        const langChainMessages = this.convertToLangChainMessages(allMessages);
+Here's the code with line numbers:
+File: ${fileName}
 
-        // Convert tool definitions to LangChain format
-        const langChainTools = tools.map(t => {
-            const schemaObj: any = {};
-            if (t.parameters.properties) {
-                for (const [key, value] of Object.entries(t.parameters.properties)) {
-                    const prop = value as any;
-                    if (prop.type === 'string') {
-                        schemaObj[key] = prop.enum
-                            ? z.enum(prop.enum).optional().describe(prop.description || '')
-                            : z.string().optional().describe(prop.description || '');
-                    } else if (prop.type === 'number') {
-                        schemaObj[key] = z.number().optional().describe(prop.description || '');
-                    } else if (prop.type === 'array') {
-                        schemaObj[key] = z.array(z.number()).optional().describe(prop.description || '');
-                    }
-                }
-            }
+${code.split('\n').map((line, i) => `${i + 1}: ${line}`).join('\n')}
 
-            return tool(
-                async (input) => JSON.stringify(input),
-                {
-                    name: t.name,
-                    description: t.description,
-                    schema: z.object(schemaObj)
-                }
-            );
-        });
+Student's question: "${question}"
+
+Analyze the question and identify which lines of code the student is asking about.
+
+You MUST respond with ONLY a JSON object in this exact format, no other text:
+{
+    "understood": true,
+    "concept": "brief name of the concept (e.g., 'for loop', 'dictionary', 'function call')",
+    "startLine": <number>,
+    "endLine": <number>,
+    "explanation": "one sentence explaining what this section does"
+}
+
+If the question is not about a specific part of the code, or you can't identify relevant lines, respond with:
+{
+    "understood": false,
+    "concept": "",
+    "startLine": 0,
+    "endLine": 0,
+    "explanation": ""
+}
+
+Rules:
+- startLine and endLine should be actual line numbers from the code
+- Include all related lines (e.g., if asking about a loop, include the entire loop body)
+- For multi-line constructs, include the full construct
+- Be inclusive rather than exclusive when determining line ranges
+
+Respond with ONLY the JSON object:`;
 
         try {
-            const llmWithTools = this.llm.bindTools(langChainTools);
-            const response = await llmWithTools.invoke(langChainMessages);
-
-            const toolCalls: ToolCall[] = [];
-            if (response.tool_calls && response.tool_calls.length > 0) {
-                for (const tc of response.tool_calls) {
-                    toolCalls.push({
-                        id: tc.id || `call_${Date.now()}`,
-                        name: tc.name,
-                        args: tc.args
-                    });
-                }
+            const response = await this.llm.invoke([new HumanMessage(prompt)]);
+            const content = response.content as string;
+            
+            // Extract JSON from the response
+            const jsonMatch = content.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                const parsed = JSON.parse(jsonMatch[0]);
+                return parsed as TargetedSection;
             }
-
-            return {
-                content: response.content as string,
-                toolCalls: toolCalls.length > 0 ? toolCalls : undefined
-            };
+            
+            return null;
         } catch (error) {
-            console.error('LLM Tool Error:', error);
-            throw error;
+            console.error('Error identifying targeted section:', error);
+            return null;
         }
     }
 }
